@@ -1,0 +1,149 @@
+name: Reusable Terraform Docs Workflow
+
+# Add permissions to allow writing to the repository
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  workflow_call:
+    inputs:
+      terraform_docs_config_file:
+        description: "Path to the terraform-docs config file"
+        required: false
+        type: string
+        default: ".terraform-docs.yml"
+      working_directory:
+        description: "Directory to generate docs in (defaults to repository root)"
+        required: false
+        type: string
+        default: "."
+      terraform_docs_version:
+        description: "Version of terraform-docs to install (e.g. v0.20.0)"
+        required: false
+        type: string
+        default: "v0.20.0"
+    secrets:
+      token:
+        # Optional. Defaults to GITHUB_TOKEN.
+        # A PAT is not required for CI re-triggering — the workflow uses
+        # http.extraheader for git credentials (replicating actions/checkout@v2
+        # behavior), which bypasses GitHub's loop-prevention detection so
+        # downstream workflows fire normally on the docs commit.
+        # Pass a PAT only if GITHUB_TOKEN lacks sufficient repository access
+        # (e.g. certain private-repo configurations).
+        description: >
+          GitHub token used to check out and push to the repository.
+          Defaults to GITHUB_TOKEN. A PAT is not required for CI re-triggering.
+          Pass one only if GITHUB_TOKEN lacks sufficient repository access.
+        required: false
+
+jobs:
+  terraform-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.token || github.token }}
+          # persist-credentials: false prevents checkout@v6 from embedding the
+          # token in the remote URL (https://x-access-token:TOKEN@github.com/...).
+          # URL-embedded credentials trigger GitHub's loop-prevention, which
+          # suppresses workflow runs on the resulting commit. We configure
+          # credentials manually below using http.extraheader instead, which
+          # replicates actions/checkout@v2 behavior and does not trigger
+          # loop-prevention — so CI re-fires on the docs commit without a PAT.
+          persist-credentials: false
+
+      - name: Configure git credentials
+        run: |
+          ENCODED=$(echo -n "x-access-token:${TOKEN}" | base64 | tr -d '\n')
+          git config --global http.https://github.com/.extraheader "AUTHORIZATION: basic ${ENCODED}"
+        env:
+          TOKEN: ${{ secrets.token || github.token }}
+
+      - name: Validate inputs
+        run: |
+          # Guard against path traversal in working_directory
+          resolved=$(realpath -m "$WORKING_DIR")
+          repo_root=$(realpath "$GITHUB_WORKSPACE")
+          if [[ "$resolved" != "$repo_root" && "$resolved" != "$repo_root/"* ]]; then
+            echo "::error::working_directory '$WORKING_DIR' resolves outside the repository root."
+            exit 1
+          fi
+          # Guard against path traversal in terraform_docs_config_file
+          config_resolved=$(realpath -m "$CONFIG_FILE")
+          if [[ "$config_resolved" != "$repo_root" && "$config_resolved" != "$repo_root/"* ]]; then
+            echo "::error::terraform_docs_config_file '$CONFIG_FILE' resolves outside the repository root."
+            exit 1
+          fi
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::terraform_docs_config_file '$CONFIG_FILE' does not exist."
+            exit 1
+          fi
+        env:
+          WORKING_DIR: ${{ inputs.working_directory }}
+          CONFIG_FILE: ${{ inputs.terraform_docs_config_file }}
+
+      - name: Install terraform-docs
+        run: |
+          VERSION="$TDOCS_VERSION"
+          curl -sSLo ./terraform-docs.tar.gz "https://terraform-docs.io/dl/${VERSION}/terraform-docs-${VERSION}-linux-amd64.tar.gz"
+          curl -sSLo ./SHA256SUMS "https://terraform-docs.io/dl/${VERSION}/terraform-docs-${VERSION}.sha256sum"
+          grep "terraform-docs-${VERSION}-linux-amd64.tar.gz" SHA256SUMS | sha256sum --check --status
+          tar -xzf terraform-docs.tar.gz
+          chmod +x terraform-docs
+          mkdir -p $HOME/bin
+          mv terraform-docs $HOME/bin
+          echo "$HOME/bin" >> $GITHUB_PATH
+        env:
+          TDOCS_VERSION: ${{ inputs.terraform_docs_version }}
+
+      - name: Generate README.md files
+        run: |
+          cd "$WORKING_DIR"
+          terraform-docs -c "$CONFIG_FILE" .
+        env:
+          WORKING_DIR: ${{ inputs.working_directory }}
+          CONFIG_FILE: ${{ inputs.terraform_docs_config_file }}
+
+      - name: Remove terraform-docs.tar.gz from repository and runner
+        run: |
+          # Remove from repository if present
+          if git ls-files --error-unmatch terraform-docs.tar.gz > /dev/null 2>&1; then
+            git rm terraform-docs.tar.gz
+          fi
+          # Remove from runner filesystem (current dir and $HOME)
+          rm -f terraform-docs.tar.gz
+          rm -f $HOME/terraform-docs.tar.gz
+
+      - name: Commit and push documentation changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage tracked files that changed and any new .md files terraform-docs may have created
+          git add -u
+          git add -- '**/*.md' '*.md'
+
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Update documentation files"
+
+          # Retry push with rebase on non-fast-forward conflicts
+          BRANCH="${HEAD_REF:-$GITHUB_REF_NAME}"
+          for i in 1 2 3; do
+            git push origin "HEAD:$BRANCH" && break
+            echo "Push attempt $i failed, rebasing and retrying..."
+            git fetch origin "$BRANCH"
+            git rebase "origin/$BRANCH" || { echo "::error::Rebase failed, aborting."; exit 1; }
+            sleep 5
+          done
+        env:
+          HEAD_REF: ${{ github.head_ref }}
