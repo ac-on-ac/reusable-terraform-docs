@@ -1,4 +1,4 @@
-name: Reusable Terraform Docs Workflow
+name: Terraform Docs
 
 # Add permissions to allow writing to the repository
 permissions:
